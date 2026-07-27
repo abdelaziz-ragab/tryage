@@ -1,0 +1,295 @@
+# Tryage — Proof of Concept Build Plan
+
+*Working name: Tryage. A merge-queue failure resolution engine that identifies every faulty PR in a failed batch in a single parallel round, instead of the sequential one-at-a-time bisection used by every existing tool today.*
+
+## 1. Product Overview
+
+### 1.1 The problem
+
+Companies with large, high-velocity monorepos batch multiple pull requests together into a single CI run before merging, to save compute (this is what a "merge queue" does — tools like Mergify, Aviator, and GitHub's native merge queue all offer this). When a batch fails, the system must figure out which PR(s) caused the failure. Every current tool does this by **bisection**: split the batch in half, retest, repeat, until one bad PR is isolated. This reliably finds exactly **one** faulty PR per full bisection pass.
+
+The gap: if **two or more** PRs in the same batch are simultaneously broken, today's tools need to repeat the entire bisection cycle multiple times — batch again, bisect again — to catch each one. This is slow (each round waits on the previous one to finish) and, in the one case where a competitor (Graphite, now owned by Cursor) has addressed multi-fault detection in a single pass, it does so by brute force — testing every PR in the batch separately in parallel, which is fast but expensive at scale.
+
+### 1.2 The solution
+
+Use techniques from **combinatorial group testing** (the same mathematical idea behind pooled medical testing, e.g. pooled COVID sample testing) to design a small number of cleverly overlapping test batches. Run them all in parallel in a single round. From the pattern of which pooled batches pass and which fail, mathematically decode exactly which PR(s) are at fault — without needing to test every PR individually, and without needing multiple sequential rounds.
+
+**In one sentence:** identify every faulty PR in a batch, in one parallel round, using meaningfully fewer CI runs than testing everyone separately.
+
+### 1.3 Why this, why now
+
+- Confirmed via direct prior work experience (Shopify's CI/merge-queue team) that this was a known, unresolved backlog item even at Graphite, the most sophisticated commercial player in this space.
+- Confirmed via research: no academic paper, patent, or shipped product combines non-adaptive combinatorial group testing with CI batch bisection. Google's and Uber's most sophisticated public culprit-finding systems are still single-culprit sequential search under the hood.
+- Real, live pain: GitHub had a production incident (April 2026) specifically because their merge-queue bisection logic wasn't built to handle more than one bad PR in a batch.
+- Graphite's brute-force "parallel isolation" mode is gated in private beta, not GA, not marketed — confirming the market hasn't standardized on an efficient answer yet.
+
+### 1.4 Target customer
+
+Engineering organizations running merge queues at real scale — large monorepos, high PR velocity. This is a narrow, high-value niche (hundreds to low thousands of companies globally), not a mass market. Customers are already paying for Mergify, Aviator, or tolerating GitHub's native queue, and have real budget because CI compute cost and engineer-blocking time are expensive at their scale.
+
+### 1.5 Positioning
+
+Sits **alongside** the customer's existing merge queue rather than replacing it. Listens for batch-failure webhooks, resolves the failure using its own CI orchestration, and hands the result back via the existing queue tool's API (dequeue bad PRs, release good ones). No need to convince a company to rip out tooling they've already adopted — this dramatically lowers sales friction versus building a full competing merge queue.
+
+### 1.6 Long-term shape of the company
+
+This PoC is the wedge, not the whole company. The intended growth path (for context, not for PoC scope):
+
+1. **Wedge:** multi-fault bisection engine (this document)
+2. **Expand surface:** general CI failure resolution layer (flaky-vs-real classification, auto-suggested fixes)
+3. **Go org-wide:** aggregate resolution history into org-wide failure intelligence (risky code owners, flaky hotspots)
+4. **Become the platform:** bundle in predictive test selection, build cost optimization — competing at the level of Gradle Develocity / Datadog CI Visibility / Depot
+5. **Outcome:** either an independent CI-intelligence platform, or a natural acquisition by a player already circling this space (Cursor, GitHub, Datadog)
+
+## 2. High-Level Architecture
+
+```
+┌─────────────────────────────┐     ┌─────────────────────────────┐
+│  EXISTING MERGE QUEUE        │     │  CI PROVIDER                 │
+│  Mergify / Aviator / GitHub  │     │  GitHub Actions / CircleCI /  │
+│  (source of batch-failure    │     │  Buildkite                    │
+│   events)                    │     │  (runs the actual test jobs)  │
+└──────────────┬────────────────┘     └──────────────┬────────────────┘
+               │                                       │
+               ▼                                       │
+        ┌─────────────────┐                            │
+        │ 1. Webhook       │                            │
+        │    Listener      │                            │
+        └────────┬─────────┘                            │
+                 ▼                                       │
+        ┌─────────────────┐                              │
+        │ 2. Batch Context │                              │
+        │    Builder       │                              │
+        └────────┬─────────┘                              │
+                 ▼                                        │
+        ┌─────────────────┐                               │
+        │ 3. Combinatorial │  ◄── CORE DIFFERENTIATOR      │
+        │    Design Engine │                               │
+        └────────┬─────────┘                               │
+                 ▼                                         │
+        ┌─────────────────┐                                │
+        │ 4. CI Orchestrator│──── triggers pooled runs ─────┘
+        └────────┬─────────┘
+                 ▼
+        ┌─────────────────┐
+        │ 5. Result Decoder │  ◄── CORE DIFFERENTIATOR
+        │  (probabilistic,  │
+        │   flake-aware)    │
+        └────────┬─────────┘
+              ┌───┴────┐
+              ▼         ▼
+     ┌────────────┐  ┌────────────┐
+     │ 6a. Root-   │  │ 6b. Action  │──── dequeues/releases via
+     │ Cause LLM   │  │ Layer       │     merge-queue API
+     └──────┬──────┘  └──────┬──────┘
+            └────────┬───────┘
+                     ▼
+             ┌────────────────┐
+             │ 7. Resolution   │  ◄── THE MOAT (history compounds)
+             │    Store        │
+             └────────┬────────┘
+                      ▼
+             ┌────────────────┐
+             │ 8. Dashboard     │──── feedback loop back to
+             │  (confirm/       │     Design Engine (recalibration)
+             │   override)      │
+             └────────────────┘
+```
+
+Blue-tier / differentiated components: **3 (Design Engine)** and **5 (Result Decoder)**. Everything else is necessary plumbing that gets you to the point where the differentiated core can do its job.
+
+## 3. Tech Stack
+
+| Layer | Choice | Why |
+| --- | --- | --- |
+| Combinatorial design + decoding engine | **Python** (numpy, scipy) | This is where the real IP lives. Python's numerical ecosystem is the path of least resistance for matrix/pooling-design math and probabilistic decoding. Build as a standalone library, independently testable, with zero dependency on the integration layer. |
+| Integration / orchestration layer | **TypeScript/Node**, using **Probot** | Probot is purpose-built for GitHub Apps (handles auth, webhook verification, installation management). This layer touches the messiest real-world surface (GitHub, CircleCI, Buildkite APIs), so use the ecosystem with the least boilerplate. |
+| Workflow orchestration | **Temporal** (or **Inngest** if Temporal feels heavy to self-host initially) | The core workflow shape is "fire off N parallel CI runs, wait on async webhook callbacks, handle timeouts/retries, then decide" — a durable-workflow problem, not a request/response one. Don't hand-roll this state machine. |
+| Primary datastore | **Postgres** | System of record for PRs, batches, resolutions, confidence scores, org config. This schema **is** the long-term resolution-history moat — treat it as a first-class asset from day one, not an afterthought. |
+| Ephemeral/fast state | **Redis** | In-flight job state, rate limiting. |
+| Root-cause explanation | **Claude API**, direct call | Thin, well-scoped LLM use — feed it the failing logs + culprit PR diff, get back a plain-English explanation and optional fix suggestion. No agent framework needed at this stage. |
+| Dashboard | **Next.js + Tailwind + shadcn/ui** | Fastest path for a solo dev to ship a credible-looking UI without weeks of frontend plumbing. |
+| Hosting (PoC/early pilots) | **Fly.io** or **Railway** for services, **Vercel** for dashboard | Avoid AWS complexity until a real customer needs VPC/compliance guarantees. Migrate later. |
+| Error tracking | **Sentry** | Standard, low-effort to wire in early. |
+
+## 4. PoC Definition & Success Criteria
+
+The PoC's job is to prove the **core algorithmic claim** — not to sign a customer, not to build the full dashboard. Everything in Milestones 0–4 can be built and validated with **zero customers and zero live integrations**. Only after the algorithm is proven does it make sense to build the GitHub integration and pursue a design partner.
+
+**The PoC is successful if, in simulation across realistic batch sizes (4–32 PRs) and realistic fault counts (0–3 simultaneous faults):**
+
+1. The design engine resolves all faulty PRs in **1 round** (occasionally 2, via the adaptive fallback) in the overwhelming majority of cases — versus the ~k × log₂(N) sequential rounds a standard bisector needs for k faults.
+2. The design engine uses **meaningfully fewer total CI runs** than brute-force "test every PR separately" (Graphite's current approach) — target: roughly 40–60% fewer runs at typical batch sizes with 1–2 faults.
+3. The decoder maintains **>95% correct-culprit identification** even when realistic flaky-test noise is injected (industry flake rates run roughly 10–25% of test suites).
+4. Historical replay on real open-source CI data shows a consistent, positive result (not just synthetic data) — this is the number that goes in a pitch deck.
+
+If any of these fail — especially #3 (noise robustness) — that's critical information to have **before** building any integration work, not after.
+
+## 5. Phased Feature Build Plan
+
+Each milestone lists: what to build, what tech is involved, the definition of done, and — critically — **what to test immediately after finishing it**, before moving to the next milestone. Do not proceed to the next milestone until the current one's tests pass. This is meant to be worked through sequentially with Claude Code, one milestone at a time.
+
+### Milestone 0 — Project scaffolding
+
+**Build:** Repo structure as above. Python package skeleton for engine/ with a test runner (pytest) configured. Node/TypeScript skeleton for app/ with a test runner (vitest or jest) configured. CI (GitHub Actions) running both test suites on every push.
+
+**Definition of done:** pytest and npm test both run green on an empty/skeleton codebase, CI pipeline is green.
+
+**Test immediately after:** Confirm CI actually fails on a deliberately broken test in each package (sanity-check that your own test infra works before building anything real on top of it).
+
+### Milestone 1 — Core combinatorial design engine (clean case)
+
+**Build:** Given N (batch size) and k (max simultaneous faults to tolerate), generate a non-adaptive pooling matrix — a set of overlapping groups such that any combination of up to k faulty items among N produces a unique failure pattern. Start with the simplest working construction (binary/Sperner-style encoding for k=1, extend to small k via a cover-free/disjunct-matrix construction — a random or structured construction is fine for PoC, doesn't need to be asymptotically optimal). Pair it with a **decoder** that takes a clean (noiseless) pass/fail pattern and returns the exact set of faulty PRs.
+
+**Tech:** Python, numpy for matrix operations.
+
+**Definition of done:** For N in {8, 16, 32} and k in {1, 2, 3}, the design+decode round-trip correctly identifies every possible combination of faulty PRs, with zero noise, 100% of the time.
+
+**Test immediately after:**
+
+- Unit tests: exhaustively test every possible fault combination (not just random samples) for small N (e.g., all C(8,2) combinations for N=8, k=2) — this is small enough to brute-force-verify completely.
+- Property test: verify the number of groups used is meaningfully smaller than N (i.e., meaningfully better than brute force) for each (N, k) pair — log this as a benchmark table, this is your first real evidence for the pitch.
+- **Do not proceed to Milestone 2 until this is 100% correct on the clean case.** Noise-handling on top of a shaky clean-case foundation will hide bugs, not reveal them.
+
+### Milestone 2 — Noisy/probabilistic decoding
+
+**Build:** Replace the clean boolean decoder with a probabilistic one. Each pooled test result is treated as a noisy signal (a "fail" might be a flaky test, not a real fault). Implement a simple Bayesian confidence update: given the observed pass/fail pattern and a per-repo prior flake rate, compute a posterior probability that each PR is genuinely faulty, rather than a hard yes/no. (Don't reach for a full probabilistic programming framework like PyMC here — a hand-rolled Bayesian update is simpler to reason about and sufficient for PoC.)
+
+**Tech:** Python, numpy/scipy for the probability math.
+
+**Definition of done:** Given a batch with injected synthetic faults **and** injected synthetic flakiness (configurable flake rate), the decoder outputs a confidence score per PR, and the highest-confidence PR(s) match the true injected faults above a target accuracy threshold.
+
+**Test immediately after:**
+
+- Build the **simulation harness** now if not already started (see Milestone 4 — you may want to pull it forward here since you need it to properly test this milestone anyway): inject faults + flakiness at varying rates (0%, 5%, 15%, 25%) across many randomized trials, measure decode accuracy at each flake rate.
+- This is the single most important test in the whole PoC: **if accuracy collapses at realistic flake rates (~15-25%), that's the moment to stop and rethink the decoding approach**, before any further building. Don't skip past a bad result here.
+
+### Milestone 3 — Adaptive fallback for exceeded fault tolerance
+
+**Build:** Handle the case where more PRs are simultaneously faulty than the design was built to tolerate (e.g., design was built for k=2 but 3 PRs are actually bad). Detect decode ambiguity, trigger one small, targeted follow-up round to resolve it, rather than silently returning a wrong or incomplete answer.
+
+**Tech:** Python, extends the Milestone 1/2 engine.
+
+**Definition of done:** When fault count exceeds the design's tolerance, the system correctly detects ambiguity (does not confidently return a wrong answer) and the fallback round successfully resolves the remaining uncertainty.
+
+**Test immediately after:**
+
+- Simulate fault counts deliberately exceeding k (e.g., design for k=2, inject 3–4 faults) across many trials — verify ambiguity is detected, not silently misreported, and the fallback round converges to the correct answer.
+- Regression test: rerun all Milestone 1 and 2 tests to confirm nothing broke.
+
+### Milestone 4 — Formal simulation & benchmark harness
+
+**Build:** A proper CLI/script tool (if not already pulled forward from Milestone 2) that runs configurable large-scale simulations: batch size distribution, fault-count distribution, flake rate, and CI parallelism ceiling as inputs; outputs comparison metrics (rounds needed, total CI runs, wall-clock estimate) for three approaches side by side: (a) sequential bisection [today's standard], (b) brute-force parallel isolation [Graphite's current approach], (c) your combinatorial design.
+
+**Tech:** Python, plus a simple plotting/reporting layer (matplotlib or just tabular output) to generate shareable results.
+
+**Definition of done:** Running the harness across a realistic range of parameters produces a clear, defensible comparison table/chart showing time and cost deltas between all three approaches. This is the artifact that goes in front of design partners.
+
+**Test immediately after:**
+
+- Sanity-check the harness itself against hand-computed small cases (don't trust a benchmarking tool you haven't verified).
+- Run the full battery across the parameter ranges defined in the PoC success criteria (Section 4) and check the results against the target thresholds. If targets aren't met, this is a decision point: adjust the design construction, or revisit assumptions, before moving to real-world data.
+
+### Milestone 5 — Historical replay validation
+
+**Build:** A module that ingests real historical CI/merge-queue data from public sources (open-source projects using bors/homu-style merge queues, or public GitHub Actions history with merge groups) and replays failed batches through your engine to see what it would have done versus what actually happened.
+
+**Tech:** Python, GitHub API (read-only, public data) or downloaded CI logs, reusing the engine/ package from Milestones 1–3.
+
+**Definition of done:** A report showing, across a meaningful sample of real historical batch failures, how often multiple simultaneous faults actually occurred (this also tells you how common the problem is — valuable for the pitch) and what your engine's resolution time/cost would have been versus the sequential approach that was actually used.
+
+**Test immediately after:**
+
+- Manually audit a sample of the replayed results by hand (pick 10–15 real historical failures, verify your engine's conclusion against what you can independently confirm from the commit history) — this catches subtle bugs that synthetic simulation can't, because real data is messier than synthetic data.
+
+**This is the end of the "no integration needed" phase of the PoC.** Milestones 0–5 can be fully completed solo, with no customer, no live GitHub App, no design partner. If the results here don't hold up, stop and revisit the algorithm before building any integration work.
+
+### Milestone 6 — GitHub webhook listener + batch context builder
+
+**Build:** A minimal Probot-based GitHub App that listens for merge-queue / check-suite events, normalizes them into your internal batch-failure event format, and fetches the relevant PR diffs and metadata for a failed batch.
+
+**Tech:** Node/TypeScript, Probot, Octokit.
+
+**Definition of done:** Deployed against a sandbox GitHub repo you control, the app correctly detects a batch failure event and produces a structured internal representation of the batch (which PRs, what they changed).
+
+**Test immediately after:**
+
+- Set up a sandbox repo with a real merge queue configured. Manually push a batch of PRs, some deliberately broken, and confirm the webhook listener correctly captures the failure event and batch composition.
+- Test edge cases: batch of 1 PR, batch where all PRs are fine (false trigger check), webhook delivery retries/duplicates.
+
+### Milestone 7 — CI orchestrator
+
+**Build:** Given the pooling design from the engine/ package, dynamically create the necessary branches/PRs combining the designed PR groups, and trigger CI runs for each pooled group via the CI provider's API (start with GitHub Actions only for PoC).
+
+**Tech:** Node/TypeScript, GitHub Actions API, Temporal (or Inngest) to manage the "wait for N parallel runs" workflow.
+
+**Definition of done:** For a real failed batch on the sandbox repo, the orchestrator correctly creates and triggers the pooled test runs designed by the engine, and collects their results.
+
+**Test immediately after:**
+
+- End-to-end test on the sandbox repo: inject synthetic faults into real PRs (deliberately break 1–2 of them), let the full pipeline (webhook → context builder → design engine → orchestrator) run, and manually verify the correct pooled runs were triggered.
+- Test failure handling: what happens if one of the pooled CI runs itself times out or errors (not fails, but infrastructure-errors) — this needs to be distinguished from a genuine test failure.
+
+### Milestone 8 — Result decoder integration
+
+**Build:** Wire real CI results from Milestone 7 into the probabilistic decoder from Milestone 2/3. Produce a final, confidence-scored list of faulty PRs from a real batch failure.
+
+**Tech:** Node/TypeScript orchestration layer calling into the Python engine/ package (via HTTP API or subprocess — pick whichever is simpler to wire up, HTTP via a small FastAPI wrapper around the engine is probably cleanest).
+
+**Definition of done:** A full real end-to-end run — real batch failure on the sandbox repo, through webhook, context building, design, orchestration, and decoding — produces a correct, confidence-scored culprit list.
+
+**Test immediately after:**
+
+- Full end-to-end test on the sandbox repo with **realistic flaky test injection** (deliberately make one test in the suite intermittently fail, unrelated to the actual injected faults) — verify the system doesn't get confused by it.
+- This is your first fully real, integrated test of the entire core value proposition. Run it multiple times across different fault/flake combinations before moving on.
+
+### Milestone 9 — Root-cause LLM layer
+
+**Build:** Once a culprit PR is identified, pull its diff and the relevant failure logs, and call the Claude API to generate a plain-English explanation of why it likely broke the batch, with an optional suggested fix.
+
+**Tech:** Node/TypeScript, Claude API.
+
+**Definition of done:** For a resolved batch failure, the system produces a readable, accurate-sounding explanation referencing the actual diff and failure logs (not a generic/hallucinated one).
+
+**Test immediately after:**
+
+- Qualitative review: run this against 15–20 of the historical replay cases from Milestone 5 (you already know the ground truth for those) and manually grade the explanations for accuracy and usefulness.
+- Check for hallucination: does the explanation ever reference code or behavior that isn't actually in the diff? This needs a human eye, not an automated test, at this stage.
+
+### Milestone 10 — Action layer + dashboard (shadow mode only)
+
+**Build:** The action layer posts a comment on the culprit PR and, in **shadow mode**, does *not* actually dequeue anything — it only records what it *would* have done. The dashboard shows the resolution history, confidence scores, and the LLM explanation, and lets a human confirm or override.
+
+**Tech:** Node/TypeScript for the action layer (posting comments, recording decisions — but not yet calling dequeue APIs), Next.js dashboard reading from Postgres.
+
+**Definition of done:** A working, deployed dashboard showing real (sandbox) resolution history, and the system correctly identifies itself as running in shadow/recommend-only mode — no autonomous queue actions yet.
+
+**Test immediately after:**
+
+- Full dry run on the sandbox repo end-to-end, confirm the dashboard accurately reflects what happened, confidence scores are visible and sensible, and the "would have acted" log is being recorded correctly.
+- **This is the point where the PoC is complete and ready to take to a design partner** for the shadow-mode pilot described in the growth plan — read-only access to a real company's batch-failure webhooks, comparing your system's conclusions against their real, existing bisection outcomes, without ever touching their production merge queue.
+
+## 6. What Comes After the PoC (not in scope for this build, for context only)
+
+1. **Shadow-mode pilot** with 1–2 real design partners (via warm intro network) — passive observation, comparing your system's conclusions against their real outcomes, no production actions.
+2. **Active mode** — once shadow-mode shows a consistent, real win, allow the action layer to actually dequeue PRs, initially gated by a high confidence threshold, with easy one-click undo.
+3. **Multi-provider support** — extend beyond GitHub Actions to CircleCI, Buildkite.
+4. **Resolution store intelligence layer** — org-wide dashboards on repeat offenders, flaky hotspots, risky code owners, once enough history has accumulated.
+5. Everything in the longer growth map (Section 1.6).
+
+## 7. Key Risks to Monitor Throughout (revisit at every milestone)
+
+- **Flakiness overwhelming the signal.** If Milestone 2's accuracy collapses at realistic flake rates, this is the single biggest threat to the whole premise. Don't paper over a bad result here.
+- **Compute tradeoff not panning out at realistic CI parallelism limits.** The cost advantage over brute force assumes you can actually run several pooled groups in parallel — if a customer's CI infrastructure has a low parallelism ceiling, the advantage shrinks. Model this explicitly in Milestone 4's harness, don't assume unlimited parallelism.
+- **Multi-fault batches being rarer in practice than assumed.** Milestone 5's historical replay is what answers this honestly — if simultaneous multi-fault batches turn out to be very rare in real data, that changes how the product should be pitched (still valuable, but the value prop shifts from "we solve a common problem" to "we solve an expensive, occasional problem").
+- **Engineering complexity vs. payoff.** Sequential bisection is dumb and simple, which is why every existing vendor uses it. Everything in Milestones 1–3 is real algorithmic complexity — make sure each milestone's tests are genuinely passed, not just "close enough," before adding more complexity on top.
+
+## 8. Glossary (for shared vocabulary with Claude Code / future collaborators)
+
+- **Merge queue:** a system that batches multiple PRs together, tests them as one unit before merging, to save CI compute.
+- **Bisection:** the standard method of finding a faulty commit/PR by repeatedly splitting a batch in half and retesting.
+- **Combinatorial group testing:** a mathematical technique for identifying multiple "bad" items among many by testing cleverly overlapping pools rather than each item individually — the same principle used in pooled medical testing.
+- **Non-adaptive design:** a testing plan where all test groups are decided up front and run in parallel, as opposed to adaptive/sequential testing where each round depends on the previous one's result.
+- **Cover-free / disjunct matrix:** the mathematical structure used to guarantee that any combination of up to k simultaneous faults produces a uniquely decodable failure pattern.
+- **Flaky test:** a test that passes or fails inconsistently without any underlying code change, purely from noise/nondeterminism.
+- **Shadow mode:** running the system passively, observing and recording what action it *would* take, without actually taking that action — used to build trust and validate accuracy before going autonomous.
