@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  engine:
+    name: engine (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install engine
+        working-directory: engine
+        run: pip install -e ".[dev]"
+      - name: Run pytest
+        working-directory: engine
+        run: pytest -v
+
+  app:
+    name: app (npm test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: app/package-lock.json
+      - name: Install dependencies
+        working-directory: app
+        run: npm ci
+      - name: Typecheck
+        working-directory: app
+        run: npm run typecheck
+      - name: Run tests
+        working-directory: app
+        run: npm test

@@ -1,0 +1,16 @@
+{
+  "name": "tryage-app",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Integration/orchestration layer for Tryage (webhook listener, CI orchestrator, action layer)",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.10"
+  }
+}
