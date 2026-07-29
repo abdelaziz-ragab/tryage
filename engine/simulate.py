@@ -17,3 +17,26 @@ def run_clean(matrix: np.ndarray, faulty: Iterable[int]) -> np.ndarray:
     if not faulty:
         return np.zeros(matrix.shape[0], dtype=bool)
     return matrix[:, faulty].any(axis=1)
+
+
+def run_noisy(
+    matrix: np.ndarray,
+    faulty: Iterable[int],
+    flake_rate: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Simulate pooled test outcomes with injected flakiness.
+
+    Models flakiness as a binary symmetric channel: the true (noiseless)
+    outcome of each pooled test is computed as in run_clean, then each
+    entry is independently flipped with probability flake_rate. This
+    covers both directions real flaky tests exhibit - a clean pool
+    observed as a spurious fail, or a genuinely faulty pool observed as a
+    spurious pass - with a single, simple, configurable knob rather than
+    separate false-positive/false-negative rates.
+    """
+    if not 0.0 <= flake_rate <= 1.0:
+        raise ValueError("flake_rate must be in [0, 1]")
+    true_outcomes = run_clean(matrix, faulty)
+    flips = rng.random(matrix.shape[0]) < flake_rate
+    return true_outcomes ^ flips
