@@ -16,7 +16,7 @@ dependencies = [
 dev = ["pytest>=7.4"]
 
 [tool.setuptools]
-py-modules = ["design", "decode", "simulate", "harness", "calibration"]
+py-modules = ["design", "decode", "simulate", "harness", "calibration", "adaptive"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

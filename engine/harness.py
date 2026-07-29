@@ -8,9 +8,10 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from adaptive import AdaptiveDecoder
 from decode import ProbabilisticDecoder
 from design import build_pooling_matrix
-from simulate import run_noisy
+from simulate import run_clean, run_noisy
 
 
 @dataclass
@@ -166,6 +167,86 @@ def print_flake_rate_report(
                     f"{p:>10.1%} {r:>8.1%} {f1:>6.1%}"
                 )
     return results
+
+
+@dataclass
+class AdaptiveTrialResult:
+    true_faulty: frozenset[int]
+    decoded: frozenset[int]
+    used_fallback: bool
+    extra_tests: int
+
+
+@dataclass
+class AdaptiveSweepResult:
+    n: int
+    k: int
+    fault_count: int
+    num_trials: int
+    trials: list[AdaptiveTrialResult] = field(default_factory=list)
+
+    @property
+    def exact_match_rate(self) -> float:
+        hits = sum(1 for t in self.trials if t.decoded == t.true_faulty)
+        return hits / self.num_trials
+
+    @property
+    def fallback_rate(self) -> float:
+        return sum(1 for t in self.trials if t.used_fallback) / self.num_trials
+
+    @property
+    def avg_extra_tests_fraction(self) -> float:
+        """Average real extra-test cost (beyond the original T-row round),
+        as a fraction of n - counts every actual run_pool call, whether
+        that's just the 1-test complement verification or the full
+        suspects-based resolution."""
+        return sum(t.extra_tests for t in self.trials) / (self.num_trials * self.n)
+
+
+def run_adaptive_sweep(
+    n: int,
+    k: int,
+    fault_count: int,
+    num_trials: int,
+    *,
+    design_seed: int | None = 0,
+    trial_seed: int | None = None,
+) -> AdaptiveSweepResult:
+    """Run num_trials randomized trials with exactly fault_count faults
+    injected (typically fault_count > k, to exercise Milestone 3's
+    fallback) against one fixed design, measuring both correctness and the
+    real cost of the fallback (how many extra tests it actually needed
+    beyond the original round, as a fraction of n) - the number that
+    determines whether "one small, targeted follow-up round" holds up as a
+    real claim or degenerates to full brute force in practice.
+    """
+    matrix = build_pooling_matrix(n, k, seed=design_seed)
+    decoder = AdaptiveDecoder(matrix, k)
+    rng = np.random.default_rng(trial_seed)
+
+    result = AdaptiveSweepResult(n=n, k=k, fault_count=fault_count, num_trials=num_trials)
+    for _ in range(num_trials):
+        true_faulty = frozenset(rng.choice(n, size=fault_count, replace=False).tolist())
+        outcomes = run_clean(matrix, true_faulty)
+
+        call_count = 0
+
+        def run_pool(subset: set[int], _faulty=true_faulty) -> bool:
+            nonlocal call_count
+            call_count += 1
+            return bool(subset & _faulty)
+
+        decoded, used_fallback = decoder.decode(outcomes, run_pool)
+
+        result.trials.append(
+            AdaptiveTrialResult(
+                true_faulty=true_faulty,
+                decoded=frozenset(decoded),
+                used_fallback=used_fallback,
+                extra_tests=call_count,
+            )
+        )
+    return result
 
 
 if __name__ == "__main__":
