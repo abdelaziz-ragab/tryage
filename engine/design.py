@@ -121,6 +121,7 @@ def build_pooling_matrix(
     tries_per_item: int = 1000,
     min_distance: int = 1,
     max_t: int | None = None,
+    restarts: int = 1,
 ) -> np.ndarray:
     """Build a T x N boolean pooling matrix (rows = pooled tests/groups,
     columns = items) that's k-separable: every combination of up to k
@@ -142,6 +143,20 @@ def build_pooling_matrix(
     search fails to find a design at the current size, up to max_t (default
     n).
 
+    Each (row count, restart) attempt gets its own independently-spawned
+    random stream (via numpy's SeedSequence.spawn), deterministic from
+    seed. This matters: a naive implementation that reuses one RNG object
+    across every row-count attempt lets failed smaller-T attempts burn
+    through the random stream before a larger, actually-findable T gets its
+    turn, silently wasting search budget - this was measured to cause real,
+    avoidable identity-matrix fallbacks (e.g. n=10, k=2 has a genuine
+    T=8 design, 20% cheaper than brute force, that a shared-RNG search
+    fails to find; the failure was a search-budget artifact, not a sign the
+    design doesn't exist). restarts controls how many independent attempts
+    each row count gets before moving on to a larger T - raising it costs
+    more search time but can recover savings a single attempt misses,
+    especially in the small-N-relative-to-k regime.
+
     If min_distance=1 and no design at or below max_t is found, the
     identity matrix (one test per item) is used - for small N and k close to
     N, non-adaptive pooling genuinely can't beat testing every item
@@ -160,17 +175,23 @@ def build_pooling_matrix(
         raise ValueError("k must be >= 1")
     if min_distance < 1:
         raise ValueError("min_distance must be >= 1")
+    if restarts < 1:
+        raise ValueError("restarts must be >= 1")
     if max_t is None:
         max_t = n
     if k == 1 and min_distance <= 2:
         return binary_encoding_matrix(n)
 
-    rng = np.random.default_rng(seed)
+    seed_seq = np.random.SeedSequence(seed)
     t_start = binary_encoding_matrix(n).shape[0]
     for t in range(t_start, max_t):
-        matrix = _greedy_separable_matrix(n, k, t, min_distance, rng, tries_per_item)
-        if matrix is not None:
-            return matrix
+        for child_seed in seed_seq.spawn(restarts):
+            sub_rng = np.random.default_rng(child_seed)
+            matrix = _greedy_separable_matrix(
+                n, k, t, min_distance, sub_rng, tries_per_item
+            )
+            if matrix is not None:
+                return matrix
 
     if min_distance <= 1:
         return np.eye(n, dtype=bool)

@@ -70,6 +70,7 @@ def run_sweep(
     min_distance: int = 1,
     max_t: int | None = None,
     tries_per_item: int = 1000,
+    restarts: int = 1,
 ) -> SweepResult:
     """Run num_trials randomized trials at a fixed flake_rate: for each
     trial, pick a random fault count in [0, k], inject that many random
@@ -86,6 +87,9 @@ def run_sweep(
     docstring and design.py's Milestone 2 notes: min_distance=1 is the
     Milestone 1 default (merely-separable, no noise margin); raising it
     buys back decode accuracy under noise at the cost of more pooled tests.
+    restarts is also forwarded - see design.py's notes on why a single
+    search attempt can miss a cheaper design that more restarts would find,
+    particularly in the small-N-relative-to-k regime.
     """
     matrix = build_pooling_matrix(
         n,
@@ -94,6 +98,7 @@ def run_sweep(
         min_distance=min_distance,
         max_t=max_t,
         tries_per_item=tries_per_item,
+        restarts=restarts,
     )
     if prior_fault_rate is None:
         # Expected fault count if fault_count ~ Uniform(0, k) is k/2.

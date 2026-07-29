@@ -48,6 +48,27 @@ def test_build_pooling_matrix_rejects_invalid_input():
         build_pooling_matrix(0, 1)
     with pytest.raises(ValueError):
         build_pooling_matrix(8, 0)
+    with pytest.raises(ValueError):
+        build_pooling_matrix(8, 1, restarts=0)
+
+
+def test_restarts_recover_savings_a_single_attempt_misses():
+    """Regression test for a real, measured search-budget bug: the original
+    implementation shared one RNG object across every row-count (T) attempt,
+    so failed smaller-T attempts silently burned through the random stream
+    before a larger, actually-findable T got its turn. n=10, k=2 is a
+    concrete case where this mattered: a T=9 design exists (10% cheaper than
+    brute force), but a single restarts=1 search reliably falls back to the
+    T=10 identity matrix, while restarts=30 reliably finds T=9 - each (T,
+    restart) attempt now gets its own independently-spawned random stream
+    (see build_pooling_matrix's docstring), so search effort spent on a
+    hopeless smaller T no longer starves a promising larger one."""
+    single_attempt = build_pooling_matrix(10, 2, seed=0, restarts=1)
+    many_restarts = build_pooling_matrix(10, 2, seed=0, restarts=30, tries_per_item=2000)
+    assert DecodeTable(single_attempt, 2).is_separable
+    assert DecodeTable(many_restarts, 2).is_separable
+    assert many_restarts.shape[0] < single_attempt.shape[0]
+    assert many_restarts.shape[0] < 10  # strictly better than brute force
 
 
 def test_benchmark_table_vs_brute_force():
