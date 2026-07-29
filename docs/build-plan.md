@@ -219,7 +219,22 @@ Each milestone lists: what to build, what tech is involved, the definition of do
 
 - Manually audit a sample of the replayed results by hand (pick 10–15 real historical failures, verify your engine's conclusion against what you can independently confirm from the commit history) — this catches subtle bugs that synthetic simulation can't, because real data is messier than synthetic data.
 
-**This is the end of the "no integration needed" phase of the PoC.** Milestones 0–5 can be fully completed solo, with no customer, no live GitHub App, no design partner. If the results here don't hold up, stop and revisit the algorithm before building any integration work.
+### Milestone 5.5 — Strict/deterministic decode mode (no flake tolerance)
+
+**Build:** Some customers won't want probabilistic flake-tolerance at all — their policy is "any observed failure in the merge queue is a deal-breaker," full stop, with no attempt to hedge or exonerate a PR because a failure *might* have been flaky. For that segment, the Milestone 2 Bayesian layer is unnecessary complexity: build a configurable "strict mode" that decodes using only the exact Milestone 1 table (deterministic, no confidence scores) and, on any observed pattern that doesn't match a known fault-combo entry — which will still happen, since a flaky test can corrupt a pooled result regardless of the customer's tolerance policy — fails safe by treating every PR in the affected pool as held and triggering Milestone 3's adaptive fallback round, rather than raising an unhandled error or guessing.
+
+Also measure the risk this mode trades away: pooling groups multiple PRs per test, so a single flaky result can force strict mode to hold *every* PR in that pool, whereas sequential bisection isolates down to one PR before implicating anyone. Quantify "PRs held per flaky incident" for strict-mode pooling versus bisection, using real flake-incident rates from Milestone 5's historical replay data (not synthetic assumptions) now that it's available.
+
+**Tech:** Python, extends the Milestone 1/3 engine (no Milestone 2 Bayesian dependency for the decode path itself).
+
+**Definition of done:** A working strict mode that never produces a confidence score or hedges — every decode either resolves to an exact fault set or deterministically triggers the fallback round — plus a measured, real-data-grounded comparison of "PRs held per flaky incident" between strict-mode pooling and sequential bisection.
+
+**Test immediately after:**
+
+- Confirm strict mode is fully deterministic: same observed pattern always produces the same outcome (decoded set or fallback trigger), never a probability.
+- Run the blast-radius comparison across the batch sizes already tested and report it plainly, including if it comes out unfavorably (e.g. if strict-mode pooling ends up holding *more* PRs per flaky incident than bisection would have) — that's a real, segment-specific finding to report honestly, the same way Milestone 2's flake-collapse finding was, not something to soften or bury.
+
+**This is the end of the "no integration needed" phase of the PoC.** Milestones 0–5.5 can be fully completed solo, with no customer, no live GitHub App, no design partner. If the results here don't hold up, stop and revisit the algorithm before building any integration work.
 
 ### Milestone 6 — GitHub webhook listener + batch context builder
 
