@@ -53,7 +53,12 @@ def _noisy_read(is_fault_present: bool, flake_rate: float, rng: np.random.Genera
 
 
 def simulate_bisection(
-    n: int, faulty: set[int], flake_rate: float, rng: np.random.Generator
+    n: int,
+    faulty: set[int],
+    flake_rate: float,
+    rng: np.random.Generator,
+    *,
+    test_both_halves: bool = False,
 ) -> ApproachResult:
     """One full bisection pass finds a single culprit via binary search
     (test one half; if it fails, recurse into it, else the other half);
@@ -64,6 +69,30 @@ def simulate_bisection(
     dependency chain), matching "the sequential one-at-a-time bisection
     used by every existing tool today" (build-plan.md Section 1.1).
 
+    test_both_halves=False (default) is the textbook "elimination" variant:
+    test one half, infer the other's status without spending a test. This
+    was the only variant used through Milestones 4-5, and for it,
+    logical_rounds == ci_runs == waves exactly, since every level does
+    exactly one test. test_both_halves=True tests both halves explicitly
+    at every level - found necessary when comparing against real
+    competitors (docs/build-plan.md "Competitor methodology"): the
+    confirmed academic cost formula for real production bisection systems
+    (Beheshtian, Bavand & Rigby, IEEE TSE 2022) is 2*log2(n)+1 per culprit,
+    which only matches the both-halves-tested variant - public vendor docs
+    for Aviator/Mergify/Graphite don't specify which convention their
+    actual implementations use, so both are modeled and reported as a
+    range rather than silently picking the more flattering one.
+
+    Testing both halves costs more CI runs, but NOT necessarily more
+    rounds: the two half-tests don't depend on each other, so a real
+    system could dispatch them as one parallel wave and only the level
+    *after* is a new sequential round (the next split needs both results).
+    logical_rounds is tracked per split-level for exactly this reason, not
+    incremented per CI run - conflating the two would overstate how much
+    slower the conservative variant is, artificially inflating this
+    engine's relative speed advantage in a comparison that's supposed to
+    be honest in both directions.
+
     Under noise, a single corrupted read can send the search down the
     wrong branch or "find" a phantom culprit - this isn't special-cased,
     it's simulated directly (a fresh noisy read every single test, exactly
@@ -73,6 +102,7 @@ def simulate_bisection(
     remaining = list(range(n))
     found: set[int] = set()
     ci_runs = 0
+    logical_rounds = 0
 
     def run_pool(subset: list[int]) -> bool:
         nonlocal ci_runs
@@ -80,19 +110,29 @@ def simulate_bisection(
         return _noisy_read(any(i in faulty for i in subset), flake_rate, rng)
 
     while remaining:
+        logical_rounds += 1
         if not run_pool(remaining):
             break
         pool = list(remaining)
         while len(pool) > 1:
+            logical_rounds += 1
             mid = len(pool) // 2
-            left = pool[:mid]
-            pool = left if run_pool(left) else pool[mid:]
+            left, right = pool[:mid], pool[mid:]
+            left_fails = run_pool(left)
+            if test_both_halves:
+                right_fails = run_pool(right)
+                pool = left if left_fails else right if right_fails else left
+            else:
+                pool = left if left_fails else right
         culprit = pool[0]
         found.add(culprit)
         remaining.remove(culprit)
 
     return ApproachResult(
-        decoded=frozenset(found), logical_rounds=ci_runs, ci_runs=ci_runs, waves=ci_runs
+        decoded=frozenset(found),
+        logical_rounds=logical_rounds,
+        ci_runs=ci_runs,
+        waves=logical_rounds,
     )
 
 

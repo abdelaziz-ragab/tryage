@@ -267,6 +267,65 @@ Real bors-ng batches are reconstructed from bors[bot]'s PR comments (each commen
 
 **The aggregate replay numbers are honestly more modest than the structural finding, and that's a real, explainable fact, not a contradiction:** across these 162 cases, avg engine rounds 1.00 vs avg actual bors rounds 1.06 (much closer than mayastor's 1.12-vs-2.12 - this project's real bot process, once it names a culprit, resolves fast), and total CI runs 1,481 (engine) vs 1,751 (brute force) - 15.4% fewer, well under the structural 40-60%. Why the gap: this sample is failure-biased (only failed rollups have clean explicit ground truth), and failures concentrate at the batch sizes rust-lang/rust uses most often in practice (6-14 PRs), not the rarer 25+ sizes where the structural savings are largest. Both numbers are real and both are reported - the structural analysis answers "does the design pay off at real large-N batch compositions" (yes), the replay answers "what did we see in the specific real incidents with usable ground truth" (a smaller but still positive number, for an explainable sampling reason).
 
+### Competitor methodology research & head-to-head comparison (2026-07-30)
+
+**Why this exists:** earlier comparisons (Milestone 4) used generic "bisection" and "brute force" archetypes, with brute force casually labeled "Graphite's approach" from the original pitch framing. That characterization was never independently verified. Before putting any competitor's name on a comparison table, their actual documented method was researched properly - parallel web-research agents per company, instructed to report only sourced, confirmed technical claims and explicitly flag what couldn't be confirmed, not guess from marketing copy.
+
+**Confirmed findings, each from the vendor's own docs/engineering blog (not third-party summaries):**
+- **Aviator**: bisection, confirmed verbatim in their docs ("Aviator uses a method called bisection"), with an optional parallel-bisection config flag.
+- **Mergify**: more sophisticated than bisection - their own engineering deep-dive describes an **n-ary search** (n = configured parallel speculative checks + 1), degrading to plain binary bisection only when parallelism isn't configured.
+- **Graphite**: the "brute force" label was wrong/outdated. Current docs and their engineering blog (June 2025) confirm a **dual-strategy**: full parallel isolation (brute force) by default for small batches (≤8 stacks) or high historical failure rate, genuine binary-search bisection above that ("isolate a failing PR in a 32-PR batch with just 5 CI runs instead of 32" - their own published figure). An earlier (May 2024) blog post shows bisection was "coming soon" at the time and didn't exist yet - the feature shipped sometime in the following year.
+- **GitHub's native merge queue**: confirmed via docs.github.com to NOT bisect at all - a cumulative/incremental scheme (each PR tested on base + every PR ahead of it in queue; a failure drops that PR and retests everyone behind it). The "GitHub uses bisection" claim found circulating in some blog posts traces back to Mergify's own docs describing their own product, misattributed by third parties.
+- **bors-ng**: confirmed bisection - already exactly what Milestone 5's mayastor replay validated against real data.
+- **Not modeled** (excluded honestly rather than guessed): Trunk.io offers a "bisection" feature but publishes no algorithm detail beyond the name. Google's internal FACF (Flake Aware Culprit Finding, ICST 2023) - a Bayesian/noisy-binary-search approach conceptually close to this engine's own Milestone 2 decoder - and Uber's SubmitQueue (speculation-tree over conflicting concurrent changes) are real, well-documented, but internal/academic systems, not market competitors sold to the same customers.
+- Independent validation: an academic paper (Beheshtian, Bavand & Rigby, IEEE TSE 2022) gives a standard bisection cost formula, 2·log₂(n)+1 executions per culprit - used below to catch and fix a real gap in this project's own bisection simulator (see next paragraph).
+
+**A real bug and a real modeling gap, both caught before any numbers were trusted:**
+1. `benchmark.simulate_bisection` (used since Milestone 4) implements the "elimination" optimization - test one half, infer the other - which undercounts against the academic formula by roughly 30-45%. No public vendor doc says whether Aviator/Mergify/Graphite's real implementations use that optimization or test both halves explicitly, so **both variants are now modeled** (`test_both_halves` / `test_all_pieces` params) and reported as a range rather than silently picking the flattering one.
+2. Building the n-ary generalization for Mergify surfaced a genuine **infinite-loop bug**: with the conservative (test-all-pieces) variant and 2+ simultaneous faults landing in different pieces, all those pieces test as failing, and taking their *union* (an earlier version's logic) can reconstruct the exact pool being split with zero shrinkage - looping forever. Fixed by keeping only the first failing piece per split level (matching how `simulate_bisection` already tie-breaks), letting the outer repeat-until-clean loop catch remaining faults on a later pass. Regression test locks this in.
+3. A related, subtler issue: testing multiple pieces at one split level can happen in **parallel** (they don't depend on each other) - an early version incremented `logical_rounds` once per CI run regardless, which would have overstated how many rounds the conservative variant costs and artificially inflated this engine's reported speed advantage. Fixed to increment rounds once per split *level*, independent of how many pieces are tested within it.
+
+**Head-to-head, replayed against the exact same 178 real historical cases already used to validate this engine (16 from mayastor + 162 from rust-lang/rust rollups, all clean/noiseless replay, so every method decodes 100% correctly - the differentiator here is cost and speed, not accuracy):**
+
+| Method | Correct | Avg rounds | Total CI runs | vs. brute force |
+|---|---|---|---|---|
+| **This engine** | 178/178 | **1.01** | 1,526 | 14.7% fewer |
+| Bisection (Aviator/bors-ng), optimistic | 178/178 | 5.07 | 902 | 49.6% fewer |
+| Bisection (Aviator/bors-ng), conservative | 178/178 | 5.07 | 1,439 | 19.6% fewer |
+| Mergify (arity=2, default), optimistic | 178/178 | 5.35 | 952 | 46.8% fewer |
+| Mergify (arity=2, default), conservative | 178/178 | 5.35 | 1,539 | 14.0% fewer |
+| Mergify (arity=4, parallel checks) | 178/178 | 4.03 | 1,132 | 36.8% fewer |
+| Graphite (dual-strategy), optimistic | 178/178 | 3.56 | 958 | 46.5% fewer |
+| Graphite (dual-strategy), conservative | 178/178 | 3.56 | 1,316 | 26.5% fewer |
+| GitHub native queue | 178/178 | 1.93 | 2,926 | 63.5% *more* |
+| Brute force (naive baseline) | 178/178 | 1.00 | 1,790 | — |
+
+**This reframes the value proposition, honestly, and it's not all good news:**
+
+- **Speed (rounds) is this engine's clear, unambiguous, real-data-confirmed edge.** 71-81% fewer sequential rounds than every bisection-family competitor (Aviator, Mergify, Graphite), 48% fewer than GitHub's non-bisecting queue. This is a genuine, large, defensible advantage in time-to-merge/wall-clock across the board.
+- **On raw CI-run cost, the picture is NOT a clean win against bisection-based competitors at this real data's scale.** Aviator, Mergify's default, and Graphite are all *cheaper* than this engine in total CI runs across these 178 real cases - in some cases by a wide margin even under the conservative cost assumption. The one near-exception is Mergify's conservative variant, where this engine edges it out by under 1%. **Why**: bisection's cost scales as O(log N) per actual fault found - very cheap when there are few simultaneous faults, which both real datasets show is the common case (mostly 1, occasionally 2-3). This engine's non-adaptive design pays a fixed row count T up front, sized for its worst-case fault tolerance k, regardless of how many faults actually occurred. Segmented by batch size, the pattern holds at every size bucket tested (small, medium, and the large 25+ bucket) - it does not resolve simply by having bigger batches.
+- **Cost efficiency remains real, just narrower than originally framed**: clearly ahead of brute force (the "Graphite" comparison from Milestone 4's original framing, which is now confirmed to only be half of what Graphite actually does) and dramatically ahead of GitHub's native queue (which is confirmed to not bisect at all, and pays for it in raw CI cost, not just speed).
+- **Net honest positioning (before the fix below)**: this engine's core proven advantage over the current real competitive landscape is **speed of resolution**, not lower CI compute spend, when compared against well-implemented bisection specifically. The original Section 4 criterion #2 ("meaningfully fewer CI runs... 40-60%") holds clearly against brute force and GitHub's queue, but does not hold against Aviator/Mergify/Graphite at the batch sizes and fault-count distributions observed in real data so far. This is exactly the kind of result to have clear before further work, not after.
+
+**The fix: size the design for the realistic common case, not a worst-case tolerance target.** The cost gap above comes entirely from a choice, not a hard limit: this engine had been defaulting to k=2 (paying upfront for "up to 2 simultaneous faults" on every batch). The real fault-count distribution across all 178 real cases: **171/178 (96%) have exactly 1 actual fault** - 5 have 2, 2 have 3. Building the default design for k=1 instead (much cheaper - Milestone 1 showed roughly half the rows of a k=2 design) and leaning on Milestone 3's already-validated `AdaptiveDecoder` fallback for the rare multi-fault cases (one extra round, only ~4% of the time) changes the picture substantially:
+
+| Method | Total CI runs | Avg rounds | Cost vs. k=1 default |
+|---|---|---|---|
+| **This engine, k=1 (new recommended default)** | **903** | **1.04** | — |
+| This engine, k=2 (original default) | 1,526 | 1.01 | 41% more expensive |
+| Bisection (Aviator/bors-ng), optimistic | 902 | 5.07 | ~tied (0.1% cheaper) |
+| Bisection (Aviator/bors-ng), conservative | 1,439 | 5.07 | 37% more expensive |
+| Mergify (arity=2), optimistic | 952 | 5.35 | 5% more expensive |
+| Mergify (arity=2), conservative | 1,539 | 5.35 | 41% more expensive |
+| Graphite (dual-strategy), optimistic | 958 | 3.56 | 6% more expensive |
+| Graphite (dual-strategy), conservative | 1,316 | 3.56 | 31% more expensive |
+| GitHub native queue | 2,926 | 1.93 | 69% more expensive |
+| Brute force (baseline) | 1,790 | 1.00 | 50% more expensive |
+
+Correctness unaffected (178/178 still exactly correct - `test_k1_default_beats_k2_default_on_cost_with_negligible_round_cost`), and the round count barely moves (1.01 → 1.04) since the fallback is rare. This closes almost the entire cost gap identified above: at k=1, this engine is cheaper than or essentially tied with every real competitor's documented method except bisection's most optimistic (elimination-trick) variant, where it's a statistical tie - while remaining 71-81% faster in rounds than every bisection-family competitor. Regression tests (`test_k1_default_beats_or_ties_every_bisection_family_competitor_on_cost`, `test_k1_default_still_dramatically_fewer_rounds_than_bisection_family`) lock this in.
+
+- **Net honest positioning (updated)**: with k=1 as the default design tolerance, this engine is now validated on real data as both **faster** (71-81% fewer rounds than any bisection-family competitor, 48% fewer than GitHub) **and** **cost-competitive-to-cheaper** against every real competitor researched, not just brute force and GitHub's queue. The one caveat worth carrying forward: this result rests on the real fault-count distribution observed so far (96% single-fault) - if a future, larger real dataset shows meaningfully more multi-fault batches, the k=1 default's cost advantage would narrow, since the fallback would trigger more often (`test_real_fault_counts_are_overwhelmingly_single_fault` exists specifically to catch that shift, not to assume it won't happen).
+
 ### Milestone 5.5 — Strict/deterministic decode mode (no flake tolerance)
 
 **Build:** Some customers won't want probabilistic flake-tolerance at all — their policy is "any observed failure in the merge queue is a deal-breaker," full stop, with no attempt to hedge or exonerate a PR because a failure *might* have been flaky. For that segment, the Milestone 2 Bayesian layer is unnecessary complexity: build a configurable "strict mode" that decodes using only the exact Milestone 1 table (deterministic, no confidence scores) and, on any observed pattern that doesn't match a known fault-combo entry — which will still happen, since a flaky test can corrupt a pooled result regardless of the customer's tolerance policy — fails safe by treating every PR in the affected pool as held and triggering Milestone 3's adaptive fallback round, rather than raising an unhandled error or guessing.
